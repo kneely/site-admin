@@ -32,6 +32,13 @@ interface IUserInfo {
     UserName: string;
 }
 
+interface IUserGroupInfo {
+    Description?: string;
+    Id: number;
+    LoginName: string;
+    Title: string;
+}
+
 const CSVFields = [
     "Name", "UserName", "Email", "Group", "GroupInfo", "FileName", "FileUrl",
     "ItemId", "ListName", "ListUrl", "Role", "RoleInfo", "WebTitle", "WebUrl"
@@ -43,7 +50,7 @@ export class SearchEEEU {
     private static _items: ISearchItem[] = null;
     private static _loadOneDrive: boolean = null;
     private static _stopFl: boolean = false;
-    private static _groupsByUserId: { [key: number]: any[] } = {};
+    private static _groupsByUserId: { [key: number]: IUserGroupInfo[] } = {};
     private static _users: IUserInfo[] = null;
 
     // Analyzes a lists
@@ -225,7 +232,7 @@ export class SearchEEEU {
     }
 
     // Parses the groups the user belongs to for the current web
-    private static parseUserGroups(web: Types.SP.WebOData, userInfo: IUserInfo, groups: any[]) {
+    private static parseUserGroups(web: Types.SP.WebOData, userInfo: IUserInfo, groups: IUserGroupInfo[]) {
         // Parse the groups the member belongs to
         return Helper.Executor(groups, group => {
             // Parse the roles
@@ -299,8 +306,13 @@ export class SearchEEEU {
 
             let dstWeb = this._loadOneDrive ? Web.getOneDrive() : Web(DataSource.SiteContext.SiteFullUrl, { requestDigest: DataSource.SiteContext.FormDigestValue });
             dstWeb.SiteUsers(userInfo.Id).Groups().execute(groups => {
-                this._groupsByUserId[userInfo.Id] = groups.results;
-                this.parseUserGroups(web, userInfo, groups.results).then(resolve);
+                this._groupsByUserId[userInfo.Id] = groups.results.map(group => ({
+                    Description: group.Description,
+                    Id: group.Id,
+                    LoginName: group.LoginName,
+                    Title: group.Title
+                }));
+                this.parseUserGroups(web, userInfo, this._groupsByUserId[userInfo.Id]).then(resolve);
             }, resolve);
         });
     }
@@ -750,6 +762,8 @@ export class SearchEEEU {
         }).then(() => {
             // Hide the sub-nav
             this._elSubNav.classList.add("d-none");
+            this._groupsByUserId = {};
+            this._users = null;
         });
     }
 
