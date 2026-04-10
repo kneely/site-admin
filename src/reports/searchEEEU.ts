@@ -43,6 +43,8 @@ export class SearchEEEU {
     private static _items: ISearchItem[] = null;
     private static _loadOneDrive: boolean = null;
     private static _stopFl: boolean = false;
+    private static _groupsByUserId: { [key: number]: any[] } = {};
+    private static _users: IUserInfo[] = null;
 
     // Analyzes a lists
     private static analyzeList(web: Types.SP.WebOData, list: Types.SP.ListOData): PromiseLike<void> {
@@ -125,6 +127,11 @@ export class SearchEEEU {
                     return this._stopFl;
                 }
             }).then(() => {
+                if (ctrBatchJobs == 0) {
+                    resolve();
+                    return;
+                }
+
                 // Update the dialog
                 this._elSubNav.children[1].innerHTML = `Executing Batch Request for ${ctrBatchJobs} items...`;
 
@@ -217,6 +224,39 @@ export class SearchEEEU {
         ];
     }
 
+    // Parses the groups the user belongs to for the current web
+    private static parseUserGroups(web: Types.SP.WebOData, userInfo: IUserInfo, groups: any[]) {
+        // Parse the groups the member belongs to
+        return Helper.Executor(groups, group => {
+            // Parse the roles
+            for (let i = 0; i < web.RoleAssignments.results.length; i++) {
+                let role: Types.SP.RoleAssignmentOData = web.RoleAssignments.results[i] as any;
+
+                // See if the user belongs to this role
+                if (role.Member.LoginName == group.LoginName) {
+                    let roleDef = role.RoleDefinitionBindings.results[0];
+
+                    // Add the user information
+                    let roleItem = {
+                        WebUrl: web.Url,
+                        WebTitle: web.Title,
+                        Id: userInfo.Id,
+                        LoginName: userInfo.Name,
+                        Name: userInfo.Title || userInfo.Name,
+                        Email: userInfo.EMail,
+                        Group: group.Title,
+                        GroupId: group.Id,
+                        GroupInfo: group.Description || "",
+                        Role: roleDef?.Name || "",
+                        RoleInfo: roleDef?.Description || ""
+                    };
+                    this._items.push(roleItem);
+                    this._dashboard.Datatable.addRow(roleItem);
+                }
+            }
+        });
+    }
+
     // Get the user information
     private static getUserInfo(web: Types.SP.WebOData, userInfo: IUserInfo) {
         // Return a promise
@@ -251,37 +291,16 @@ export class SearchEEEU {
             }
 
             // Get the groups the user is associated with
+            let groups = this._groupsByUserId[userInfo.Id];
+            if (groups) {
+                this.parseUserGroups(web, userInfo, groups).then(resolve);
+                return;
+            }
+
             let dstWeb = this._loadOneDrive ? Web.getOneDrive() : Web(DataSource.SiteContext.SiteFullUrl, { requestDigest: DataSource.SiteContext.FormDigestValue });
             dstWeb.SiteUsers(userInfo.Id).Groups().execute(groups => {
-                // Parse the groups the member belongs to
-                Helper.Executor(groups.results, group => {
-                    // Parse the roles
-                    for (let i = 0; i < web.RoleAssignments.results.length; i++) {
-                        let role: Types.SP.RoleAssignmentOData = web.RoleAssignments.results[i] as any;
-
-                        // See if the user belongs to this role
-                        if (role.Member.LoginName == group.LoginName) {
-                            let roleDef = role.RoleDefinitionBindings.results[0];
-
-                            // Add the user information
-                            let roleItem = {
-                                WebUrl: web.Url,
-                                WebTitle: web.Title,
-                                Id: userInfo.Id,
-                                LoginName: userInfo.Name,
-                                Name: userInfo.Title || userInfo.Name,
-                                Email: userInfo.EMail,
-                                Group: group.Title,
-                                GroupId: group.Id,
-                                GroupInfo: group.Description || "",
-                                Role: roleDef?.Name || "",
-                                RoleInfo: roleDef?.Description || ""
-                            };
-                            this._items.push(roleItem);
-                            this._dashboard.Datatable.addRow(roleItem);
-                        }
-                    }
-                }).then(resolve);
+                this._groupsByUserId[userInfo.Id] = groups.results;
+                this.parseUserGroups(web, userInfo, groups.results).then(resolve);
             }, resolve);
         });
     }
@@ -290,6 +309,11 @@ export class SearchEEEU {
     private static getUsers(): PromiseLike<IUserInfo[]> {
         // Return a promise
         return new Promise((resolve, reject) => {
+            if (this._users) {
+                resolve(this._users);
+                return;
+            }
+
             let users: IUserInfo[] = [];
 
             // Get the user information list
@@ -315,6 +339,7 @@ export class SearchEEEU {
                 }
 
                 // Resolve the request
+                this._users = users;
                 resolve(users);
             }, reject);
         });
@@ -664,6 +689,8 @@ export class SearchEEEU {
     static run(el: HTMLElement, auditOnly: boolean, values: { [key: string]: any }, onClose: () => void) {
         this._loadOneDrive = values["LoadOneDrive"] == "true";
         this._stopFl = false;
+        this._groupsByUserId = {};
+        this._users = null;
 
         // Show a loading dialog
         LoadingDialog.setHeader("Searching Site");
