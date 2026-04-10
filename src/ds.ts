@@ -79,6 +79,76 @@ export enum RequestTypes {
  * Data Source
  */
 export class DataSource {
+    private static readonly _maxThrottleRetries = 3;
+    private static readonly _throttleRetryDelay = 1000;
+    private static readonly _maxThrottleRetryDelay = 10000;
+
+    private static getRequestHeaderValue(ex: any, headerName: string) {
+        let request = ex?.xhr?.request || ex?.request || ex;
+        if (request?.headers?.get) {
+            return request.headers.get(headerName) || request.headers.get(headerName.toLowerCase());
+        }
+        if (typeof (request?.getResponseHeader) === "function") {
+            return request.getResponseHeader(headerName);
+        }
+        return null;
+    }
+
+    private static getThrottleDelay(ex: any, retryCount: number) {
+        let retryAfter = this.getRequestHeaderValue(ex, "Retry-After");
+        if (retryAfter) {
+            let retryAfterSeconds = parseInt(retryAfter, 10);
+            if (!isNaN(retryAfterSeconds)) {
+                return retryAfterSeconds * 1000;
+            }
+
+            let retryAfterDate = new Date(retryAfter);
+            let retryAfterDelay = retryAfterDate.getTime() - new Date().getTime();
+            if (!isNaN(retryAfterDelay) && retryAfterDelay > 0) {
+                return retryAfterDelay;
+            }
+        }
+
+        let retryAfterMs = this.getRequestHeaderValue(ex, "x-ms-retry-after-ms");
+        retryAfterMs = retryAfterMs || this.getRequestHeaderValue(ex, "X-MS-Retry-After-Ms");
+        if (retryAfterMs) {
+            let delay = parseInt(retryAfterMs, 10);
+            if (!isNaN(delay)) {
+                return delay;
+            }
+        }
+
+        return Math.min(this._throttleRetryDelay * Math.pow(2, retryCount), this._maxThrottleRetryDelay);
+    }
+
+    private static isThrottledRequest(ex: any) {
+        let status = ex?.status || ex?.xhr?.status || ex?.request?.status || 0;
+        if (status === 429 || status === 503) {
+            return true;
+        }
+
+        let responseText = typeof (ex?.response) === "string" ? ex.response : JSON.stringify(ex?.response || ex || "");
+        return responseText.toLowerCase().indexOf("throttl") >= 0;
+    }
+
+    static executeWithThrottleRetry<T>(executeRequest: (resolve: (value?: T) => void, reject: (error?: any) => void) => void, retryCount: number = 0): PromiseLike<T> {
+        return new Promise((resolve, reject) => {
+            executeRequest(resolve, ex => {
+                if (this.isThrottledRequest(ex) && retryCount < this._maxThrottleRetries) {
+                    let delay = this.getThrottleDelay(ex, retryCount);
+                    console.warn(`[Site Admin] Request throttled. Retrying in ${delay}ms.`, ex);
+
+                    setTimeout(() => {
+                        this.executeWithThrottleRetry(executeRequest, retryCount + 1).then(resolve, reject);
+                    }, delay);
+                    return;
+                }
+
+                reject(ex);
+            });
+        });
+    }
+
     // Method to process requests to add to the list
     static addRequest(url: string, requests: IRequest[]): PromiseLike<IResponse[]> {
         let responses: IResponse[] = [];
@@ -421,9 +491,13 @@ export class DataSource {
         // Return a promise
         return new Promise((resolve, reject) => {
             // Get the libraries for this site
-            v2.sites({ siteId: DataSource.Site.Id, webId }).drives().execute(resp => {
+            this.executeWithThrottleRetry<Types.Microsoft.Graph.drive[]>((resolveRequest, rejectRequest) => {
+                v2.sites({ siteId: DataSource.Site.Id, webId }).drives().execute(resp => {
+                    resolveRequest(resp.results);
+                }, rejectRequest);
+            }).then(drives => {
                 // Find the target drive
-                let drive = resp.results.find(a => { return a.name == listName; });
+                let drive = drives.find(a => { return a.name == listName; });
 
                 // Resolve the request
                 resolve(drive?.id);
@@ -526,14 +600,18 @@ export class DataSource {
             }).drives(driveId).items(folderId);
 
             // Return a promise
-            return new Promise(resolve => {
+            return new Promise((resolve, reject) => {
                 // Get the files for the folder
                 let folders = driveFolder.children();
-                folders.query({
-                    GetAllItems: true,
-                    Select: ["createdBy", "driveId", "file", "folder", "id", "name", "parentReference", "sensitivityLabel", "webUrl"],
-                    Top: 5000
-                }).execute(resp => {
+                DataSource.executeWithThrottleRetry<any>((resolveRequest, rejectRequest) => {
+                    folders.query({
+                        GetAllItems: true,
+                        Select: ["createdBy", "driveId", "file", "folder", "id", "name", "parentReference", "sensitivityLabel", "webUrl"],
+                        Top: 5000
+                    }).execute(resp => {
+                        resolveRequest(resp);
+                    }, rejectRequest);
+                }).then(resp => {
                     // Parse the items
                     Helper.Executor(resp["d"].value, (driveItem: Types.Microsoft.Graph.driveItem) => {
                         if (stopFl) { return; }
@@ -562,7 +640,7 @@ export class DataSource {
                         // Resolve the request
                         resolve(files);
                     });
-                });
+                }, reject);
             });
         }
 
@@ -573,12 +651,16 @@ export class DataSource {
             // See if we are getting a specific folder
             if (folderId) {
                 // Get the files
-                getFiles(driveId, folderId).then(() => { resolve(files); });
+                getFiles(driveId, folderId).then(() => { resolve(files); }, reject);
             } else {
                 // Get the root folder
-                drive.root().execute(rootFolder => {
+                this.executeWithThrottleRetry<Types.Microsoft.Graph.driveItem>((resolveRequest, rejectRequest) => {
+                    drive.root().execute(rootFolder => {
+                        resolveRequest(rootFolder);
+                    }, rejectRequest);
+                }).then(rootFolder => {
                     // Get the files
-                    getFiles(driveId, rootFolder.id).then(() => { resolve(files); });
+                    getFiles(driveId, rootFolder.id).then(() => { resolve(files); }, reject);
                 }, reject);
             }
         });
@@ -594,18 +676,22 @@ export class DataSource {
             // Return a promise
             return new Promise(resolve => {
                 // Get the files for the folder
-                v2.sites({
-                    siteId: isOneDrive ? this.OneDriveSite.Id : this.Site.Id,
-                    webId, targetInfo: {
-                        disableProcessing: true,
-                        keepalive: true
-                    }
-                }).drives(driveId).items(folderId).children().query({
-                    Filter: "folder ne null",
-                    GetAllItems: true,
-                    Select: ["driveId", "folder", "id", "name"],
-                    Top: 5000
-                }).execute(resp => {
+                this.executeWithThrottleRetry<any>((resolveRequest, rejectRequest) => {
+                    v2.sites({
+                        siteId: isOneDrive ? this.OneDriveSite.Id : this.Site.Id,
+                        webId, targetInfo: {
+                            disableProcessing: true,
+                            keepalive: true
+                        }
+                    }).drives(driveId).items(folderId).children().query({
+                        Filter: "folder ne null",
+                        GetAllItems: true,
+                        Select: ["driveId", "folder", "id", "name"],
+                        Top: 5000
+                    }).execute(resp => {
+                        resolveRequest(resp);
+                    }, rejectRequest);
+                }).then(resp => {
                     // Parse the items
                     Helper.Executor(resp["d"].value, (driveItem: Types.Microsoft.Graph.driveItem) => {
                         // Add the folder item
@@ -636,11 +722,15 @@ export class DataSource {
                 });
             } else {
                 // Get the root folder
-                v2.drive({
-                    driveId,
-                    webId,
-                    siteId: isOneDrive ? this.OneDriveSite.Id : this.Site.Id,
-                }).root().execute(root => {
+                this.executeWithThrottleRetry<Types.Microsoft.Graph.driveItem>((resolveRequest, rejectRequest) => {
+                    v2.drive({
+                        driveId,
+                        webId,
+                        siteId: isOneDrive ? this.OneDriveSite.Id : this.Site.Id,
+                    }).root().execute(root => {
+                        resolveRequest(root);
+                    }, rejectRequest);
+                }).then(root => {
                     // Load the items for this folder
                     getFolders(driveId, root.id).then(() => {
                         // Resolve the request
@@ -697,13 +787,12 @@ export class DataSource {
 
             // Get the items
             let list = props.listName ? web.Lists(props.listName) : web.Lists().getById(props.listId);
-            list.Items().query(props.query).execute(
-                items => {
-                    // Resolve the request
-                    resolve(items.results);
-                },
-                reject
-            )
+            this.executeWithThrottleRetry<any>((resolveRequest, rejectRequest) => {
+                list.Items().query(props.query).execute(resolveRequest, rejectRequest)
+            }).then(items => {
+                // Resolve the request
+                resolve(items.results);
+            }, reject);
         });
     }
 
@@ -826,12 +915,16 @@ export class DataSource {
         // Return a promise
         return new Promise((resolve, reject) => {
             // Load the site
-            Site.getOneDrive().execute(site => {
+            this.executeWithThrottleRetry<Types.SP.Site>((resolveRequest, rejectRequest) => {
+                Site.getOneDrive().execute(resolveRequest, rejectRequest);
+            }).then(site => {
                 // Set the site
                 this._oneDriveSite = site;
 
                 // Load the web
-                Web.getOneDrive().execute(web => {
+                this.executeWithThrottleRetry<Types.SP.Web>((resolveRequest, rejectRequest) => {
+                    Web.getOneDrive().execute(resolveRequest, rejectRequest);
+                }).then(web => {
                     // Save the reference and resolve the request
                     this._oneDriveWeb = web;
                     resolve();
@@ -850,35 +943,37 @@ export class DataSource {
         // Return a promise
         return new Promise((resolve, reject) => {
             // Load the web
-            Site(this.SiteContext.SiteFullUrl, { requestDigest: this.SiteContext.FormDigestValue }).query({
-                Expand: ["Features", "RootWeb/AllProperties", "RootWeb/EffectiveBasePermissions", "Usage"],
-                Select: [
-                    "CommentsOnSitePagesDisabled",
-                    "DisableCompanyWideSharingLinks",
-                    "HubSiteId",
-                    "Id",
-                    "IsHubSite",
-                    "IsRestrictContentOrgWideSearchPolicyEnforcedOnSite",
-                    "MediaTranscriptionDisabled",
-                    "Owner",
-                    "ReadOnly",
-                    "RootWeb/Created",
-                    "RootWeb/Id",
-                    "RootWeb/Title",
-                    "RootWeb/WebTemplate",
-                    "SandboxedCodeActivationCapability",
-                    "SecondaryContact",
-                    "SensitivityLabelId",
-                    "ServerRelativeUrl",
-                    "ShareByEmailEnabled",
-                    "ShowPeoplePickerSuggestionsForGuestUsers",
-                    "SocialBarOnSitePagesDisabled",
-                    "StatusBarLink",
-                    "StatusBarText",
-                    "Url",
-                    "WriteLocked"
-                ]
-            }).execute(site => {
+            this.executeWithThrottleRetry<Types.SP.SiteOData>((resolveRequest, rejectRequest) => {
+                Site(this.SiteContext.SiteFullUrl, { requestDigest: this.SiteContext.FormDigestValue }).query({
+                    Expand: ["Features", "RootWeb/AllProperties", "RootWeb/EffectiveBasePermissions", "Usage"],
+                    Select: [
+                        "CommentsOnSitePagesDisabled",
+                        "DisableCompanyWideSharingLinks",
+                        "HubSiteId",
+                        "Id",
+                        "IsHubSite",
+                        "IsRestrictContentOrgWideSearchPolicyEnforcedOnSite",
+                        "MediaTranscriptionDisabled",
+                        "Owner",
+                        "ReadOnly",
+                        "RootWeb/Created",
+                        "RootWeb/Id",
+                        "RootWeb/Title",
+                        "RootWeb/WebTemplate",
+                        "SandboxedCodeActivationCapability",
+                        "SecondaryContact",
+                        "SensitivityLabelId",
+                        "ServerRelativeUrl",
+                        "ShareByEmailEnabled",
+                        "ShowPeoplePickerSuggestionsForGuestUsers",
+                        "SocialBarOnSitePagesDisabled",
+                        "StatusBarLink",
+                        "StatusBarText",
+                        "Url",
+                        "WriteLocked"
+                    ]
+                }).execute(resolveRequest, rejectRequest);
+            }).then(site => {
                 // Save the reference and resolve the request
                 this._site = site;
 
@@ -911,23 +1006,25 @@ export class DataSource {
         // Return a promise
         return new Promise((resolve, reject) => {
             // Load the web
-            Web(url, { requestDigest: this.SiteContext.FormDigestValue }).query({
-                Expand: ["AllProperties"],
-                Select: [
-                    "Configuration",
-                    "CommentsOnSitePagesDisabled",
-                    "Created",
-                    "ExcludeFromOfflineClient",
-                    "HasUniqueRoleAssignments",
-                    "Id",
-                    "NoCrawl",
-                    "SearchScope",
-                    "SensitivityLabelId",
-                    "Title",
-                    "Url",
-                    "WebTemplate"
-                ]
-            }).execute(web => {
+            this.executeWithThrottleRetry<Types.SP.WebOData>((resolveRequest, rejectRequest) => {
+                Web(url, { requestDigest: this.SiteContext.FormDigestValue }).query({
+                    Expand: ["AllProperties"],
+                    Select: [
+                        "Configuration",
+                        "CommentsOnSitePagesDisabled",
+                        "Created",
+                        "ExcludeFromOfflineClient",
+                        "HasUniqueRoleAssignments",
+                        "Id",
+                        "NoCrawl",
+                        "SearchScope",
+                        "SensitivityLabelId",
+                        "Title",
+                        "Url",
+                        "WebTemplate"
+                    ]
+                }).execute(resolveRequest, rejectRequest);
+            }).then(web => {
                 // Save the reference and resolve the request
                 this._web = web;
                 resolve();

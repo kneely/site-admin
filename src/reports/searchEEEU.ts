@@ -39,6 +39,12 @@ interface IUserGroupInfo {
     Title: string;
 }
 
+interface IUniquePermItem {
+    FileLeafRef?: string;
+    FileRef?: string;
+    Id: number;
+}
+
 const CSVFields = [
     "Name", "UserName", "Email", "Group", "GroupInfo", "FileName", "FileUrl",
     "ItemId", "ListName", "ListUrl", "Role", "RoleInfo", "WebTitle", "WebUrl"
@@ -52,6 +58,71 @@ export class SearchEEEU {
     private static _stopFl: boolean = false;
     private static _groupsByUserId: { [key: number]: IUserGroupInfo[] } = {};
     private static _users: IUserInfo[] = null;
+
+    private static executeListBatch(web: Types.SP.WebOData, list: Types.SP.ListOData, items: IUniquePermItem[]): PromiseLike<void> {
+        return DataSource.executeWithThrottleRetry<void>((resolve, reject) => {
+            let completed = 0;
+            let ctrBatchJobs = 0;
+            let batchWeb = this._loadOneDrive ? Web.getOneDrive() : Web(web.Url, { requestDigest: DataSource.SiteContext.FormDigestValue });
+            let batch = batchWeb.Lists().getById(list.Id);
+
+            for (let i = 0; i < items.length; i++) {
+                let item = items[i];
+
+                batch.Items(item.Id).RoleAssignments().query({
+                    Filter: `Member/Title eq 'Everyone' or substringof('spo-grid-all-users', Member/LoginName)`,
+                    Expand: [
+                        "Member", "RoleDefinitionBindings"
+                    ]
+                }).batch(roles => {
+                    // Parse the role assignments
+                    Helper.Executor(roles.results, roleAssignment => {
+                        let roleDef = roleAssignment.RoleDefinitionBindings.results[0];
+                        let user: Types.SP.User = roleAssignment.Member as any;
+
+                        // Add a row for this entry
+                        let roleItem = {
+                            Email: user.Email,
+                            FileName: item.FileLeafRef,
+                            FileUrl: item.FileRef,
+                            Group: "",
+                            GroupId: 0,
+                            GroupInfo: "",
+                            Id: user.Id,
+                            ItemId: item.Id,
+                            ListId: list.Id,
+                            ListName: list.Title,
+                            LoginName: user.LoginName,
+                            ListUrl: list.RootFolder.ServerRelativeUrl,
+                            Name: user.Title || user.LoginName,
+                            Role: roleDef?.Name || "",
+                            RoleInfo: roleDef?.Description || "",
+                            WebUrl: web.Url,
+                            WebTitle: web.Title
+                        };
+                        this._items.push(roleItem);
+                        this._dashboard.Datatable.addRow(roleItem);
+
+                        // Increment the counter and update the dialog
+                        this._elSubNav.children[1].innerHTML = `Batch Requests Processed ${++completed} of ${items.length}...`;
+                    });
+                }, ctrBatchJobs++ % Strings.MaxBatchSize == 0);
+            }
+
+            if (ctrBatchJobs === 0) {
+                resolve();
+                return;
+            }
+
+            // Update the dialog
+            this._elSubNav.children[1].innerHTML = `Executing Batch Request for ${ctrBatchJobs} items...`;
+
+            // Execute the batch jobs
+            batch.execute(() => {
+                resolve();
+            }, reject);
+        });
+    }
 
     // Analyzes a lists
     private static analyzeList(web: Types.SP.WebOData, list: Types.SP.ListOData): PromiseLike<void> {
@@ -67,17 +138,12 @@ export class SearchEEEU {
                 Select.push("FileRef");
             }
 
-            // Create a batch job
-            let completed = 0;
-            let ctrBatchJobs = 0;
-            let batchWeb = this._loadOneDrive ? Web.getOneDrive() : Web(web.Url, { requestDigest: DataSource.SiteContext.FormDigestValue });
-            let batch = batchWeb.Lists().getById(list.Id);
-
             // Update the dialog
             this._elSubNav.children[1].innerHTML = `Loading the items...`;
 
             // Get the items for the list
             let itemCounter = 0;
+            let itemsToProcess: IUniquePermItem[] = [];
             DataSource.loadItems({
                 isOnedrive: this._loadOneDrive,
                 listId: list.Id,
@@ -90,60 +156,22 @@ export class SearchEEEU {
                     // See if this item doesn't have unique permissions
                     if (!item.HasUniqueRoleAssignments) { return; }
 
-                    // Get the permissions
-                    batch.Items(item.Id).RoleAssignments().query({
-                        Filter: `Member/Title eq 'Everyone' or substringof('spo-grid-all-users', Member/LoginName)`,
-                        Expand: [
-                            "Member", "RoleDefinitionBindings"
-                        ]
-                    }).batch(roles => {
-                        // Parse the role assignments
-                        Helper.Executor(roles.results, roleAssignment => {
-                            let roleDef = roleAssignment.RoleDefinitionBindings.results[0];
-                            let user: Types.SP.User = roleAssignment.Member as any;
-
-                            // Add a row for this entry
-                            let roleItem = {
-                                Email: user.Email,
-                                FileName: item["FileLeafRef"],
-                                FileUrl: item["FileRef"],
-                                Group: "",
-                                GroupId: 0,
-                                GroupInfo: "",
-                                Id: user.Id,
-                                ItemId: item.Id,
-                                ListId: list.Id,
-                                ListName: list.Title,
-                                LoginName: user.LoginName,
-                                ListUrl: list.RootFolder.ServerRelativeUrl,
-                                Name: user.Title || user.LoginName,
-                                Role: roleDef?.Name || "",
-                                RoleInfo: roleDef?.Description || "",
-                                WebUrl: web.Url,
-                                WebTitle: web.Title
-                            };
-                            this._items.push(roleItem);
-                            this._dashboard.Datatable.addRow(roleItem);
-
-                            // Increment the counter and update the dialog
-                            this._elSubNav.children[1].innerHTML = `Batch Requests Processed ${++completed} of ${ctrBatchJobs % Strings.MaxBatchSize}...`;
-                        });
-                    }, ctrBatchJobs++ % Strings.MaxBatchSize == 0);
+                    itemsToProcess.push({
+                        FileLeafRef: item["FileLeafRef"],
+                        FileRef: item["FileRef"],
+                        Id: item.Id
+                    });
 
                     // Return the stop flag
                     return this._stopFl;
                 }
             }).then(() => {
-                if (ctrBatchJobs === 0) {
+                if (itemsToProcess.length === 0) {
                     resolve();
                     return;
                 }
 
-                // Update the dialog
-                this._elSubNav.children[1].innerHTML = `Executing Batch Request for ${ctrBatchJobs} items...`;
-
-                // Execute the batch jobs
-                batch.execute(() => {
+                this.executeListBatch(web, list, itemsToProcess).then(() => {
                     // Resolve the request
                     resolve();
                 });
@@ -163,12 +191,14 @@ export class SearchEEEU {
                     this._elSubNav.children[1].innerHTML = `Analyzing lists...`;
 
                     // Get the lists
-                    let site = this._loadOneDrive ? Web.getOneDrive() : Web(web.Url, { requestDigest: DataSource.SiteContext.FormDigestValue });
-                    site.Lists().query({
-                        Filter: "Hidden eq false",
-                        Expand: ["RootFolder"],
-                        Select: ["Id", "Title", "BaseTemplate", "HasUniqueRoleAssignments", "RootFolder/ServerRelativeUrl"]
-                    }).execute(resp => {
+                    DataSource.executeWithThrottleRetry<any>((resolveRequest, rejectRequest) => {
+                        let site = this._loadOneDrive ? Web.getOneDrive() : Web(web.Url, { requestDigest: DataSource.SiteContext.FormDigestValue });
+                        site.Lists().query({
+                            Filter: "Hidden eq false",
+                            Expand: ["RootFolder"],
+                            Select: ["Id", "Title", "BaseTemplate", "HasUniqueRoleAssignments", "RootFolder/ServerRelativeUrl"]
+                        }).execute(resolveRequest, rejectRequest);
+                    }).then(resp => {
                         let ctrList = 0;
                         let siteText = this._elSubNav.children[0].innerHTML;
 
@@ -187,7 +217,7 @@ export class SearchEEEU {
                             // Resolve the request
                             resolve(null);
                         });
-                    });
+                    }, resolve);
                 } else {
                     // Resolve the request
                     resolve();
@@ -304,8 +334,10 @@ export class SearchEEEU {
                 return;
             }
 
-            let dstWeb = this._loadOneDrive ? Web.getOneDrive() : Web(DataSource.SiteContext.SiteFullUrl, { requestDigest: DataSource.SiteContext.FormDigestValue });
-            dstWeb.SiteUsers(userInfo.Id).Groups().execute(groups => {
+            DataSource.executeWithThrottleRetry<any>((resolveRequest, rejectRequest) => {
+                let dstWeb = this._loadOneDrive ? Web.getOneDrive() : Web(DataSource.SiteContext.SiteFullUrl, { requestDigest: DataSource.SiteContext.FormDigestValue });
+                dstWeb.SiteUsers(userInfo.Id).Groups().execute(resolveRequest, rejectRequest);
+            }).then(groups => {
                 this._groupsByUserId[userInfo.Id] = groups.results.map(group => ({
                     Description: group.Description,
                     Id: group.Id,
@@ -329,13 +361,15 @@ export class SearchEEEU {
             let users: IUserInfo[] = [];
 
             // Get the user information list
-            let web = this._loadOneDrive ? Web.getOneDrive() : Web(DataSource.SiteContext.SiteFullUrl, { requestDigest: DataSource.SiteContext.FormDigestValue });
-            web.Lists("User Information List").Items().query({
-                Filter: `Title eq 'Everyone' or substringof('spo-grid-all-users', Name)`,
-                Select: ["Id", "Name", "EMail", "Title", "UserName"],
-                GetAllItems: true,
-                Top: 5000
-            }).execute(items => {
+            DataSource.executeWithThrottleRetry<any>((resolveRequest, rejectRequest) => {
+                let web = this._loadOneDrive ? Web.getOneDrive() : Web(DataSource.SiteContext.SiteFullUrl, { requestDigest: DataSource.SiteContext.FormDigestValue });
+                web.Lists("User Information List").Items().query({
+                    Filter: `Title eq 'Everyone' or substringof('spo-grid-all-users', Name)`,
+                    Select: ["Id", "Name", "EMail", "Title", "UserName"],
+                    GetAllItems: true,
+                    Top: 5000
+                }).execute(resolveRequest, rejectRequest);
+            }).then(items => {
                 // Parse the items
                 for (let i = 0; i < items.results.length; i++) {
                     let item = items.results[i];
@@ -745,19 +779,21 @@ export class SearchEEEU {
             // Return a promise
             return new Promise(resolve => {
                 // Get the permissions
-                let web = this._loadOneDrive ? Web.getOneDrive() : Web(siteItem.text, { requestDigest: DataSource.SiteContext.FormDigestValue });
-                web.query({
-                    Expand: [
-                        "RoleAssignments", "RoleAssignments/Groups", "RoleAssignments/Member",
-                        "RoleAssignments/RoleDefinitionBindings", "SiteGroups"
-                    ]
-                }).execute(web => {
+                DataSource.executeWithThrottleRetry<Types.SP.WebOData>((resolveRequest, rejectRequest) => {
+                    let web = this._loadOneDrive ? Web.getOneDrive() : Web(siteItem.text, { requestDigest: DataSource.SiteContext.FormDigestValue });
+                    web.query({
+                        Expand: [
+                            "RoleAssignments", "RoleAssignments/Groups", "RoleAssignments/Member",
+                            "RoleAssignments/RoleDefinitionBindings", "SiteGroups"
+                        ]
+                    }).execute(resolveRequest, rejectRequest);
+                }).then(web => {
                     // Update the dialog
                     this._elSubNav.children[1].innerHTML = `Analyzing web ${counter} of ${siteItems.length}...`;
 
                     // Analyze the site
                     this.analyzeSite(web, searchLists).then(resolve);
-                });
+                }, resolve);
             });
         }).then(() => {
             // Hide the sub-nav
