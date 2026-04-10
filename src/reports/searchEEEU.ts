@@ -134,7 +134,7 @@ export class SearchEEEU {
                     return this._stopFl;
                 }
             }).then(() => {
-                if (ctrBatchJobs == 0) {
+                if (ctrBatchJobs === 0) {
                     resolve();
                     return;
                 }
@@ -240,7 +240,7 @@ export class SearchEEEU {
                 let role: Types.SP.RoleAssignmentOData = web.RoleAssignments.results[i] as any;
 
                 // See if the user belongs to this role
-                if (role.Member.LoginName == group.LoginName) {
+                if (role.Member.LoginName === group.LoginName) {
                     let roleDef = role.RoleDefinitionBindings.results[0];
 
                     // Add the user information
